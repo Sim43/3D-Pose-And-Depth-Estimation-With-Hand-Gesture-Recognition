@@ -442,6 +442,8 @@ class BodyPoseDetector:
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence
         )
+        self.csv_path = 'pose_landmarks_3d.csv'
+        self.write_header = True
 
     def process_frame(self, image, debug_image):
         image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
@@ -453,10 +455,37 @@ class BodyPoseDetector:
             mp_drawing = mp.solutions.drawing_utils
             drawing_spec = mp_drawing.DrawingSpec(thickness=2, circle_radius=2, color=(255, 255, 255))
             connection_spec = mp_drawing.DrawingSpec(thickness=2, color=(0, 0, 0))
-            mp_drawing.draw_landmarks(debug_image, pose_results.pose_landmarks, self.mp_pose.POSE_CONNECTIONS,
-                                      landmark_drawing_spec=drawing_spec,
-                                      connection_drawing_spec=connection_spec)
+
+            # Draw pose
+            mp_drawing.draw_landmarks(
+                debug_image, 
+                pose_results.pose_landmarks, 
+                self.mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=drawing_spec,
+                connection_drawing_spec=connection_spec
+            )
+
+            # Save landmarks
+            self.save_landmarks_to_csv(pose_results.pose_landmarks.landmark)
+
         return debug_image
+
+    def save_landmarks_to_csv(self, landmarks):
+        # Format: frame-wise row: [x1, y1, z1, x2, y2, z2, ..., x33, y33, z33]
+        row = []
+        for lm in landmarks:
+            row.extend([round(lm.x, 5), round(lm.y, 5), round(lm.z, 5)])
+
+        # Write to CSV
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if self.write_header:
+                header = []
+                for i in range(len(landmarks)):
+                    header += [f"x{i}", f"y{i}", f"z{i}"]
+                writer.writerow(header)
+                self.write_header = False
+            writer.writerow(row)
 
 
 class GestureRecognitionApp:
