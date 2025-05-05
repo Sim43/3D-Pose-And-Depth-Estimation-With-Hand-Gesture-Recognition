@@ -12,6 +12,53 @@ import mediapipe as mp
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
 
+from ultralytics import YOLO
+import torch
+import logging
+
+# Suppress all YOLO-related logging
+logging.getLogger('ultralytics').setLevel(logging.CRITICAL)
+
+class ObjectDetector:
+    def __init__(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[INFO] Using device: {self.device.upper()}")
+
+        self.model = YOLO('model/yolov8n.pt')
+        self.class_name_to_id = {'car': 2, 'person': 0, 'stop sign': 11, 'traffic light': 9}
+        self.model.to(self.device)
+
+        self.ref_sizes = {'car': 2.0, 'person': 0.5, 'stop sign': 0.6, 'traffic light': 0.6}
+
+    def detect_objects(self, frame):
+        class_ids = list(self.class_name_to_id.values())
+        results = self.model.predict(frame, device=self.device, classes=class_ids, verbose=False)[0]
+
+        detections = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id = int(box.cls[0])
+            class_name = self.model.names[cls_id]
+            if class_name in self.ref_sizes:
+                width = x2 - x1
+                distance = (self.ref_sizes[class_name] * 1000) / width
+                detections.append({
+                    'class': class_name,
+                    'bbox': (x1, y1, x2, y2),
+                    'distance': distance
+                })
+        return detections
+    
+
+def draw_detections(frame, detections):
+    for det in detections:
+        x1, y1, x2, y2 = det['bbox']
+        label = f"{det['class']} ({int(det['distance'])}m)"
+        cv.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
+        cv.putText(frame, label, (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    return frame
+
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -52,6 +99,9 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
+    # Object detector initialization
+    obj_detector = ObjectDetector()
+
     # Model load
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
@@ -71,123 +121,91 @@ def main():
     point_history_classifier = PointHistoryClassifier()
 
     # Read labels
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+    with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
+        keypoint_classifier_labels = [row[0] for row in csv.reader(f)]
+    with open('model/point_history_classifier/point_history_classifier_label.csv', encoding='utf-8-sig') as f:
+        point_history_classifier_labels = [row[0] for row in csv.reader(f)]
 
-    # Coordinate history
+    # History buffers
     history_length = 16
     point_history = deque(maxlen=history_length)
-
-    # Finger gesture history
     finger_gesture_history = deque(maxlen=history_length)
 
     mode = 0
 
     while True:
-        # Process Key (ESC: end)
         key = cv.waitKey(10)
-        if key == 27:  # ESC
+        if key == 27:
             break
         number, mode = select_mode(key, mode)
 
-        # Camera capture
         ret, image = cap.read()
         if not ret:
             break
-        image = cv.flip(image, 1)  # Mirror display
+        image = cv.flip(image, 1)
         debug_image = copy.deepcopy(image)
 
-        # Detection implementation
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
-
-        image.flags.writeable = False
-        hand_results = hands.process(image)
-        pose_results = pose.process(image)
-        image.flags.writeable = True
+        # Hand and pose detection
+        image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        hand_results = hands.process(image_rgb)
+        pose_results = pose.process(image_rgb)
+        image_rgb.flags.writeable = True
 
         # Hand gesture recognition
-        if hand_results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks,
-                                                hand_results.multi_handedness):
-                # Bounding box calculation
+        if hand_results.multi_hand_landmarks:
+            for hand_landmarks, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
-                # Landmark calculation
                 landmark_list = calc_landmark_list(debug_image, hand_landmarks)
 
-                # Conversion to relative coordinates / normalized coordinates
-                pre_processed_landmark_list = pre_process_landmark(
-                    landmark_list)
-                pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                # Write to the dataset file
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                pre_processed_landmark_list = pre_process_landmark(landmark_list)
+                pre_processed_point_history_list = pre_process_point_history(debug_image, point_history)
 
-                # Hand sign classification
+                logging_csv(number, mode, pre_processed_landmark_list, pre_processed_point_history_list)
+
                 hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-                if hand_sign_id == 2:  # Point gesture
+                if hand_sign_id == 2:
                     point_history.append(landmark_list[8])
                 else:
                     point_history.append([0, 0])
 
-                # Finger gesture classification
                 finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
-                        pre_processed_point_history_list)
+                if len(pre_processed_point_history_list) == history_length * 2:
+                    finger_gesture_id = point_history_classifier(pre_processed_point_history_list)
 
-                # Calculates the gesture IDs in the latest detection
                 finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                most_common_fg_id = Counter(finger_gesture_history).most_common()
 
-                # Drawing part
                 debug_image = draw_bounding_rect(True, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
-                debug_image = draw_info_text(
-                    debug_image,
-                    brect,
-                    handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
-                )
+                debug_image = draw_info_text(debug_image, brect, handedness,
+                                             keypoint_classifier_labels[hand_sign_id],
+                                             point_history_classifier_labels[most_common_fg_id[0][0]])
         else:
             point_history.append([0, 0])
 
         debug_image = draw_point_history(debug_image, point_history)
         debug_image = draw_info(debug_image, mode, number)
 
-        # Full body pose estimation
+        # Pose drawing
         if pose_results.pose_landmarks:
             mp_drawing = mp.solutions.drawing_utils
             drawing_spec = mp_drawing.DrawingSpec(thickness=2, circle_radius=2, color=(255, 255, 255))
             connection_spec = mp_drawing.DrawingSpec(thickness=2, color=(0, 0, 0))
+            mp_drawing.draw_landmarks(debug_image, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                      landmark_drawing_spec=drawing_spec,
+                                      connection_drawing_spec=connection_spec)
 
-            mp_drawing.draw_landmarks(
-                debug_image,
-                pose_results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=drawing_spec,
-                connection_drawing_spec=connection_spec
-            )
+        # Object detection + drawing
+        detections = obj_detector.detect_objects(debug_image)
+        debug_image = draw_detections(debug_image, detections)
 
-        # Screen reflection
-        cv.imshow('Hand Gesture Recognition + Full Body Pose', debug_image)
+        # Show final output
+        cv.imshow('Hand Gesture Recognition + Full Body Pose + Object Detection', debug_image)
 
     cap.release()
     cv.destroyAllWindows()
+
 
 
 def select_mode(key, mode):
